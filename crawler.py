@@ -70,6 +70,16 @@ NAV_LINK_SELECTOR = (
     "header a[href], nav a[href], footer a[href], [role='navigation'] a[href], "
     "[class*='header'] a[href], [class*='footer'] a[href]"
 )
+PRODUCT_CARD_SELECTOR = (
+    "[itemtype*='Product'], [data-product], [data-product-id], "
+    "[class*='product-card'], [class*='product_card'], [class*='product-item'], "
+    "[class*='product_item'], [class*='catalog-item'], [class*='catalog_item']"
+)
+PRODUCT_NAME_SELECTOR = (
+    "[itemprop='name'], [data-product-name], [class*='product-name'], "
+    "[class*='product_name'], [class*='product-title'], [class*='product_title'], "
+    "[class*='model'], [class*='sku'], h1, h2, h3, h4"
+)
 
 
 def _internal_links(page, base_url: str, selector: str = "a[href]") -> list[str]:
@@ -185,12 +195,31 @@ def _collect_page(page, url: str, depth: int, expand_dynamic: bool, collect_link
         ).trim()).filter(Boolean).slice(0, 100)
         """,
     )
+    product_terms = page.eval_on_selector_all(
+        PRODUCT_CARD_SELECTOR,
+        f"""
+        elements => {{
+          const names = [];
+          for (const card of elements) {{
+            const candidates = card.matches({PRODUCT_NAME_SELECTOR!r})
+              ? [card]
+              : Array.from(card.querySelectorAll({PRODUCT_NAME_SELECTOR!r}));
+            const candidate = candidates.find(element => {{
+              const style = getComputedStyle(element);
+              const rect = element.getBoundingClientRect();
+              return style.display !== 'none' && style.visibility !== 'hidden' &&
+                rect.width > 0 && rect.height > 0;
+            }});
+            if (!candidate) continue;
+            const value = (candidate.innerText || candidate.getAttribute('content') || '').trim();
+            if (value) names.push(value);
+          }}
+          return Array.from(new Set(names)).slice(0, 200);
+        }}
+        """,
+    )
     title = page.title()
     description = page.locator("meta[name='description']").get_attribute("content") or ""
-    try:
-        screenshot = page.screenshot(full_page=False)
-    except Exception:
-        screenshot = None
     return {
         "url": url,
         "depth": depth,
@@ -200,7 +229,7 @@ def _collect_page(page, url: str, depth: int, expand_dynamic: bool, collect_link
         "attributes": attributes,
         "site_terms": site_terms or [],
         "model_terms": model_terms or [],
-        "screenshot": screenshot,
+        "product_terms": product_terms or [],
         "issues": [],
         "error": "",
         "links": _internal_links(page, url) if collect_links else [],
@@ -307,7 +336,7 @@ def crawl_site(
                         "attributes": "",
                         "site_terms": [],
                         "model_terms": [],
-                        "screenshot": None,
+                        "product_terms": [],
                         "issues": [],
                         "error": str(error),
                         "links": [],
@@ -317,22 +346,30 @@ def crawl_site(
                 if smart_mode:
                     next_depth = depth + 1
                     if kind == "home":
-                        # From the homepage follow only links a visitor can reach
-                        # in the header/navigation/footer, plus visible catalog links.
+                        # The homepage is the user's entry point: follow visible links
+                        # from its blocks, header, navigation and footer, excluding
+                        # product cards until a catalog page is reached.
                         for link in result.get("nav_links", []):
                             if _looks_like_catalog_url(link):
                                 enqueue(link, next_depth, "catalog")
                             elif not _looks_like_product_url(link):
-                                enqueue(link, next_depth, "nav")
+                                enqueue(link, next_depth, "content")
                         for link in result.get("links", []):
-                            if _looks_like_catalog_url(link):
-                                enqueue(link, next_depth, "catalog")
+                            if _looks_like_product_url(link):
+                                continue
+                            enqueue(
+                                link,
+                                next_depth,
+                                "catalog" if _looks_like_catalog_url(link) else "content",
+                            )
                     elif kind == "nav":
-                        # A header/footer page can lead to another catalog section,
-                        # but its body links are not recursively crawled.
+                        # Keep following visible menu links once, but do not recursively
+                        # crawl article bodies or every link on those pages.
                         for link in result.get("nav_links", []):
                             if _looks_like_catalog_url(link):
                                 enqueue(link, next_depth, "catalog")
+                            elif not _looks_like_product_url(link):
+                                enqueue(link, next_depth, "content")
                     elif kind == "catalog":
                         product_links_seen = 0
                         for link in result.get("links", []):
@@ -343,6 +380,9 @@ def crawl_site(
                                     continue
                                 product_links_seen += 1
                                 enqueue(link, next_depth, "product")
+                    elif kind == "content":
+                        # Article and information pages are checked as endpoints.
+                        pass
                 else:
                     product_links_seen = 0
                     current_is_product = _looks_like_product_url(url)
@@ -424,9 +464,9 @@ def crawl_pages(
                         "description": "",
                         "text": "",
                         "attributes": "",
-                        "site_terms": [],
-                        "model_terms": [],
-                        "screenshot": None,
+                    "site_terms": [],
+                    "model_terms": [],
+                    "product_terms": [],
                         "issues": [],
                         "error": str(error),
                         "links": [],
