@@ -40,6 +40,10 @@ def parse_exceptions(value: str | Iterable[str] | None) -> set[str]:
     return {str(item).strip().casefold() for item in values if str(item).strip()}
 
 
+def _allowlist_phrase_pattern(phrase: str) -> str:
+    return re.escape(phrase).replace(r"\ ", r"\s+")
+
+
 def automatic_exceptions(start_url: str, pages: list[dict]) -> set[str]:
     """Build a conservative whitelist for a site's brand and product/model names."""
     values: list[str] = []
@@ -48,6 +52,10 @@ def automatic_exceptions(start_url: str, pages: list[dict]) -> set[str]:
     for page in pages:
         values.extend(page.get("site_terms", []))
         values.extend(page.get("model_terms", []))
+        # Product-card names are trusted only when the same page exposes a
+        # detectable brand/logo term, avoiding a broad whitelist of article text.
+        if page.get("site_terms"):
+            values.extend(page.get("product_terms", []))
 
     result: set[str] = set()
     for value in values:
@@ -67,6 +75,9 @@ def automatic_exceptions(start_url: str, pages: list[dict]) -> set[str]:
                     continue
                 if any(char.isdigit() for char in token) or token[:1].isupper() or token.isupper():
                     result.add(token.casefold())
+                    model_prefix = re.match(r"[A-Za-z]+", token)
+                    if any(char.isdigit() for char in token) and model_prefix and len(model_prefix.group(0)) >= 2:
+                        result.add(model_prefix.group(0).casefold())
     return result
 
 
@@ -95,6 +106,8 @@ def _is_technical_identifier(candidate: str, text: str, start: int, end: int) ->
     if "." in candidate and candidate.rsplit(".", 1)[-1].casefold() in DOMAIN_SUFFIXES | FILE_SUFFIXES:
         return True
     if (start and text[start - 1].isdigit()) or (end < len(text) and text[end].isdigit()):
+        return True
+    if re.match(r"\s+[+-]?\d", text[end:]) or re.search(r"[+-]?\d\s+$", text[:start]):
         return True
     if any(char.isdigit() for char in candidate):
         return True
@@ -132,51 +145,81 @@ def find_english_issues(
     allowlist = {item.casefold() for item in BASE_EXCEPTIONS} | parse_exceptions(custom_exceptions)
     issues: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
-
-    for match in ENGLISH_RUN_RE.finditer(text):
-        candidate = match.group(0).strip(" .,:;!?\"'«»()[]{}")
-        if not candidate or _is_technical_identifier(candidate, text, match.start(), match.end()):
+    allowed_phrase_spans = []
+    for phrase in allowlist:
+        if " " not in phrase:
             continue
-        tokens = TOKEN_RE.findall(candidate)
-        if not tokens:
-            continue
-        if candidate.casefold() in allowlist:
-            continue
-        candidate_for_tokens = candidate
-        for allowed_phrase in sorted(
-            (item for item in allowlist if " " in item),
-            key=len,
-            reverse=True,
-        ):
-            candidate_for_tokens = re.sub(
-                rf"(?<![A-Za-z]){re.escape(allowed_phrase)}(?![A-Za-z])",
-                " ",
-                candidate_for_tokens,
+        allowed_phrase_spans.extend(
+            (item.start(), item.end())
+            for item in re.finditer(
+                rf"(?<![A-Za-z]){_allowlist_phrase_pattern(phrase)}(?![A-Za-z])",
+                text,
                 flags=re.IGNORECASE,
             )
-        unknown = [
-            token for token in TOKEN_RE.findall(candidate_for_tokens)
-            if token.casefold() not in allowlist
-        ]
-        if not unknown or _is_inside_translation_parentheses(text, match.start(), match.end()):
-            continue
-
-        # Keep phrases such as "Buy now" together, but remove a whitelisted brand
-        # from a mixed match such as "Samsung collection".
-        term = " ".join(unknown)
-        key = (term.casefold(), source, _context(text, match.start(), match.end()).casefold())
-        if key in seen:
-            continue
-        seen.add(key)
-        issues.append(
-            {
-                "word": term,
-                "context": _context(text, match.start(), match.end()),
-                "source": source,
-            }
         )
-        if len(issues) >= limit:
-            break
+    technical_spans = [(item.start(), item.end()) for item in URL_RE.finditer(text)]
+
+    for match in ENGLISH_RUN_RE.finditer(text):
+        if any(start <= match.start() and match.end() <= end for start, end in technical_spans):
+            continue
+        overlapping = sorted(
+            (start, end)
+            for start, end in allowed_phrase_spans
+            if start < match.end() and end > match.start()
+        )
+        segments = []
+        cursor = match.start()
+        for start, end in overlapping:
+            if start > cursor:
+                segments.append((cursor, min(start, match.end())))
+            cursor = max(cursor, min(end, match.end()))
+        if cursor < match.end():
+            segments.append((cursor, match.end()))
+
+        for segment_start, segment_end in segments:
+            candidate = text[segment_start:segment_end].strip(" .,:;!?\"'«»()[]{}")
+            if not candidate or _is_technical_identifier(candidate, text, segment_start, segment_end):
+                continue
+            tokens = TOKEN_RE.findall(candidate)
+            if not tokens:
+                continue
+            if candidate.casefold() in allowlist:
+                continue
+            candidate_for_tokens = candidate
+            for allowed_phrase in sorted(
+                (item for item in allowlist if " " in item),
+                key=len,
+                reverse=True,
+            ):
+                candidate_for_tokens = re.sub(
+                    rf"(?<![A-Za-z]){_allowlist_phrase_pattern(allowed_phrase)}(?![A-Za-z])",
+                    " ",
+                    candidate_for_tokens,
+                    flags=re.IGNORECASE,
+                )
+            unknown = [
+                token for token in TOKEN_RE.findall(candidate_for_tokens)
+                if token.casefold() not in allowlist
+            ]
+            if not unknown or _is_inside_translation_parentheses(text, segment_start, segment_end):
+                continue
+
+            # Keep phrases such as "Buy now" together, but remove a whitelisted brand
+            # from a mixed match such as "Samsung collection".
+            term = " ".join(unknown)
+            key = (term.casefold(), source, _context(text, match.start(), match.end()).casefold())
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(
+                {
+                    "word": term,
+                    "context": _context(text, match.start(), match.end()),
+                    "source": source,
+                }
+            )
+            if len(issues) >= limit:
+                return issues
     return issues
 
 
