@@ -137,6 +137,50 @@ def _show_page(page_number: int, page: dict) -> None:
         else:
             st.markdown("<div class='status-ok'>Непереведённый английский текст не найден.</div>", unsafe_allow_html=True)
 
+
+def _finalize_pages(pages: list[dict], start_url: str, custom_exceptions: str, ignore_site_names: bool) -> None:
+    automatic_whitelist = automatic_exceptions(start_url, pages) if ignore_site_names else set()
+    st.session_state["ignored_words"] = set()
+    st.session_state["automatic_whitelist"] = automatic_whitelist
+    for key in list(st.session_state):
+        if key.startswith("ignore-word-"):
+            del st.session_state[key]
+    for page in pages:
+        page["issues"] = check_page(page, parse_exceptions(custom_exceptions) | automatic_whitelist)
+    st.session_state["automatic_whitelist_count"] = len(automatic_whitelist)
+    st.session_state["pages"] = pages
+    st.session_state["crawl_limit_reached"] = bool(pages and pages[0].get("_limit_reached"))
+
+
+def _show_navigation_plan(pages: list[dict], start_url: str) -> None:
+    labels = {
+        "home": "Главная",
+        "catalog": "Каталог",
+        "product": "Карточка товара",
+        "content": "Статья/информация",
+        "nav": "Навигация",
+    }
+    counts: dict[str, int] = {}
+    for page in pages:
+        kind = page.get("kind", "content")
+        counts[kind] = counts.get(kind, 0) + 1
+    st.markdown("### План проверки")
+    st.caption(
+        f"План построен от {start_url}: сначала главная и каталоги, затем карточки товаров, после этого статьи и остальные ссылки."
+    )
+    metric_columns = st.columns(5)
+    for column, kind in zip(metric_columns, ["home", "catalog", "product", "content", "total"]):
+        with column:
+            label = "Всего" if kind == "total" else labels.get(kind, kind)
+            value = len(pages) if kind == "total" else counts.get(kind, 0)
+            st.metric(label, value)
+    rows = [
+        {"Порядок": index, "Тип": labels.get(page.get("kind", "content"), "Страница"), "URL": page["url"]}
+        for index, page in enumerate(pages, 1)
+    ]
+    st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+
 st.markdown("<div class='eyebrow'>Translation QA / Russian websites</div>", unsafe_allow_html=True)
 st.title("Проверка качества перевода сайтов")
 st.markdown(
@@ -167,8 +211,8 @@ with st.sidebar:
         max_value=3,
         value=3,
         step=1,
-        disabled=page_mode != all_links_mode,
-        help="Используется в режиме «Все ссылки». 0 — только указанная страница, 3 — глубокий обход.",
+        disabled=page_mode == sitemap_mode,
+        help="Используется в режимах навигации и всех ссылок. 0 — только указанная страница, 3 — глубокий обход.",
     )
     max_pages = st.number_input(
         "Лимит страниц",
@@ -209,15 +253,29 @@ with st.sidebar:
         value=True,
         help="Прокрутка lazy-load, меню, аккордеоны, табы и стрелки каруселей.",
     )
+    plan_navigation = st.button(
+        "Рассчитать план навигации",
+        disabled=page_mode != navigation_mode,
+        use_container_width=True,
+        help="Показывает порядок страниц и количество до запуска проверки.",
+    )
+    check_plan = st.button(
+        "Проверить составленный план",
+        disabled=page_mode != navigation_mode or not st.session_state.get("navigation_plan_pages"),
+        type="primary",
+        use_container_width=True,
+    )
     run = st.button("Запустить проверку", type="primary", use_container_width=True)
     if st.button("Очистить результаты", use_container_width=True):
         st.session_state.pop("pages", None)
+        st.session_state.pop("navigation_plan_pages", None)
+        st.session_state.pop("navigation_plan_url", None)
         st.rerun()
     st.divider()
     st.caption("По умолчанию проверяется путь пользователя: главная, её блоки, шапка, футер, статьи, каталог и несколько карточек товара на раздел.")
 
 
-if run:
+if plan_navigation or check_plan or run:
     normalized = normalize_url(site_url)
     parsed = urlparse(normalized)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -228,30 +286,10 @@ if run:
         progress = st.progress(0)
         status = st.empty()
         try:
-            if page_mode == sitemap_mode:
-                sitemap_items = get_sitemap_pages(
-                    normalized,
-                    headers={"User-Agent": "TranslationQA/1.0"},
-                    max_pages=int(max_pages),
-                )
-                st.info(f"Отобрано страниц из sitemap: {len(sitemap_items)}")
-                sitemap_urls = [item["url"] for item in sitemap_items]
-                if sitemap_urls:
-                    pages = crawl_pages(
-                        sitemap_urls,
-                        max_pages=len(sitemap_urls),
-                        expand_dynamic=expand_dynamic,
-                        progress=progress.progress,
-                        status=status.info,
-                        headers={"User-Agent": "TranslationQA/1.0"},
-                    )
-                else:
-                    pages = []
-                    status.warning("В sitemap не найдено подходящих страниц")
-            elif page_mode == navigation_mode:
+            if plan_navigation and page_mode == navigation_mode:
                 pages = crawl_site(
                     normalized,
-                    max_depth=None,
+                    max_depth=None if unlimited_pages else int(depth),
                     max_pages=None if unlimited_pages else int(max_pages),
                     product_sample=int(product_sample),
                     expand_dynamic=expand_dynamic,
@@ -259,40 +297,82 @@ if run:
                     progress=progress.progress,
                     status=status.info,
                 )
-            else:
-                pages = crawl_site(
-                    normalized,
-                    max_depth=None if unlimited_pages else int(depth),
-                    max_pages=None if unlimited_pages else int(max_pages),
-                    product_sample=int(product_sample),
-                    expand_dynamic=expand_dynamic,
-                    smart_mode=False,
-                    progress=progress.progress,
-                    status=status.info,
-                )
-            automatic_whitelist = automatic_exceptions(normalized, pages) if ignore_site_names else set()
-            st.session_state["ignored_words"] = set()
-            st.session_state["automatic_whitelist"] = automatic_whitelist
-            for key in list(st.session_state):
-                if key.startswith("ignore-word-"):
-                    del st.session_state[key]
-            for page in pages:
-                page["issues"] = check_page(page, parse_exceptions(custom_exceptions) | automatic_whitelist)
-            st.session_state["automatic_whitelist_count"] = len(automatic_whitelist)
-            st.session_state["pages"] = pages
-            st.session_state["crawl_limit_reached"] = bool(pages and pages[0].get("_limit_reached"))
-            progress.progress(1.0)
-            if st.session_state["crawl_limit_reached"]:
-                status.warning(f"Проверка остановлена на защитном лимите: {len(pages)} страниц")
-            elif pages:
+                st.session_state["navigation_plan_pages"] = pages
+                st.session_state["navigation_plan_url"] = normalized
+                st.session_state.pop("pages", None)
+                progress.progress(1.0)
+                status.success(f"План построен: {len(pages)} страниц")
+            elif check_plan and page_mode == navigation_mode:
+                pages = st.session_state.pop("navigation_plan_pages", [])
+                plan_url = st.session_state.pop("navigation_plan_url", normalized)
+                _finalize_pages(pages, plan_url, custom_exceptions, ignore_site_names)
+                progress.progress(1.0)
                 status.success(f"Проверка завершена: {len(pages)} страниц")
+            elif run:
+                if page_mode == sitemap_mode:
+                    sitemap_items = get_sitemap_pages(
+                        normalized,
+                        headers={"User-Agent": "TranslationQA/1.0"},
+                        max_pages=int(max_pages),
+                    )
+                    st.info(f"Отобрано страниц из sitemap: {len(sitemap_items)}")
+                    sitemap_urls = [item["url"] for item in sitemap_items]
+                    if sitemap_urls:
+                        pages = crawl_pages(
+                            sitemap_urls,
+                            max_pages=len(sitemap_urls),
+                            expand_dynamic=expand_dynamic,
+                            progress=progress.progress,
+                            status=status.info,
+                            headers={"User-Agent": "TranslationQA/1.0"},
+                        )
+                    else:
+                        pages = []
+                        status.warning("В sitemap не найдено подходящих страниц")
+                elif page_mode == navigation_mode:
+                    pages = crawl_site(
+                        normalized,
+                        max_depth=None if unlimited_pages else int(depth),
+                        max_pages=None if unlimited_pages else int(max_pages),
+                        product_sample=int(product_sample),
+                        expand_dynamic=expand_dynamic,
+                        smart_mode=True,
+                        progress=progress.progress,
+                        status=status.info,
+                    )
+                else:
+                    pages = crawl_site(
+                        normalized,
+                        max_depth=None if unlimited_pages else int(depth),
+                        max_pages=None if unlimited_pages else int(max_pages),
+                        product_sample=int(product_sample),
+                        expand_dynamic=expand_dynamic,
+                        smart_mode=False,
+                        progress=progress.progress,
+                        status=status.info,
+                    )
+                st.session_state.pop("navigation_plan_pages", None)
+                st.session_state.pop("navigation_plan_url", None)
+                _finalize_pages(pages, normalized, custom_exceptions, ignore_site_names)
+                progress.progress(1.0)
+                if st.session_state["crawl_limit_reached"]:
+                    status.warning(f"Проверка остановлена на защитном лимите: {len(pages)} страниц")
+                elif pages:
+                    status.success(f"Проверка завершена: {len(pages)} страниц")
         except Exception as error:
             st.error(f"Не удалось запустить проверку: {error}")
 
 
+plan_pages = st.session_state.get("navigation_plan_pages")
+if plan_pages:
+    _show_navigation_plan(plan_pages, st.session_state.get("navigation_plan_url", site_url))
+
 pages = st.session_state.get("pages")
 if pages is None:
-    st.info("Укажите сайт слева и нажмите «Запустить проверку».")
+    if plan_pages:
+        st.info("План готов. Нажмите слева «Проверить составленный план», чтобы получить отчёт.")
+    else:
+        st.info("Укажите сайт слева и нажмите «Рассчитать план навигации» или «Запустить проверку».")
 else:
     _show_frequent_word_controls(pages)
     issue_count = sum(len(page.get("issues", [])) for page in pages)
