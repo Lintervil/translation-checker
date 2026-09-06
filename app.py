@@ -184,6 +184,7 @@ def _show_navigation_plan(pages: list[dict], start_url: str) -> None:
 st.markdown("<div class='eyebrow'>Translation QA / Russian websites</div>", unsafe_allow_html=True)
 st.title("Проверка качества перевода сайтов")
 st.markdown(
+    "<div class='lede'></div>",
     unsafe_allow_html=True,
 )
 
