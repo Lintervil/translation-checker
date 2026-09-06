@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import html
 import io
@@ -8,7 +7,6 @@ from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
 from checker import automatic_exceptions, check_page, parse_exceptions, top_words
 from crawler import crawl_pages, crawl_site, normalize_url
@@ -81,33 +79,6 @@ def _ignore_word_key(word: str) -> str:
     return f"ignore-word-{digest}"
 
 
-def _screenshot_copy_button(image: bytes, page_number: int) -> None:
-    encoded = base64.b64encode(image).decode("ascii")
-    components.html(
-        f"""
-        <button id="copy-{page_number}" style="background:#1b2633;color:#e8edf2;border:1px solid #405064;border-radius:6px;padding:7px 11px;cursor:pointer;font:14px system-ui">
-          📋 Скопировать в буфер
-        </button>
-        <span id="message-{page_number}" style="color:#8fa2b5;margin-left:8px;font:13px system-ui"></span>
-        <script>
-        const data = "data:image/png;base64,{encoded}";
-        document.getElementById('copy-{page_number}').onclick = async () => {{
-          const message = document.getElementById('message-{page_number}');
-          try {{
-            const blob = await (await fetch(data)).blob();
-            await navigator.clipboard.write([new ClipboardItem({{'image/png': blob}})]);
-            message.textContent = 'Скопировано';
-          }} catch (error) {{
-            message.textContent = 'Не удалось скопировать, скачайте файлом';
-          }}
-        }};
-        </script>
-        """,
-        height=42,
-        scrolling=False,
-    )
-
-
 def _show_frequent_word_controls(pages: list[dict]) -> None:
     counts = dict(top_words(pages))
     ignored = set(st.session_state.get("ignored_words", set()))
@@ -166,23 +137,6 @@ def _show_page(page_number: int, page: dict) -> None:
         else:
             st.markdown("<div class='status-ok'>Непереведённый английский текст не найден.</div>", unsafe_allow_html=True)
 
-        image = page.get("screenshot")
-        if image:
-            st.markdown("#### Скриншот страницы")
-            st.image(image, use_container_width=True)
-            left, right = st.columns([1, 2])
-            with left:
-                _screenshot_copy_button(image, page_number)
-            with right:
-                st.download_button(
-                    "💾 Скачать скриншот",
-                    data=image,
-                    file_name=f"translation-check-{page_number}.png",
-                    mime="image/png",
-                    key=f"screenshot-{page_number}",
-                )
-
-
 st.markdown("<div class='eyebrow'>Translation QA / Russian websites</div>", unsafe_allow_html=True)
 st.title("Проверка качества перевода сайтов")
 st.markdown(
@@ -198,14 +152,14 @@ with st.sidebar:
         placeholder="https://example.ru/",
         help="Проверяются только ссылки на том же домене.",
     )
-    sitemap_mode = "🗺 Sitemap — страницы для поисковика (рекомендуется)"
     navigation_mode = "🧭 Навигация — путь пользователя"
+    sitemap_mode = "🗺 Sitemap — страницы для поисковика"
     all_links_mode = "🔗 Все ссылки"
     page_mode = st.radio(
         "Какие страницы проверять",
-        [sitemap_mode, navigation_mode, all_links_mode],
+        [navigation_mode, sitemap_mode, all_links_mode],
         index=0,
-        help="Sitemap обычно содержит канонические страницы и не включает служебные URL.",
+        help="Навигация проверяет главную, видимые ссылки из её блоков, шапки и футера, разделы каталога и несколько карточек товара.",
     )
     depth = st.number_input(
         "Глубина обхода",
@@ -260,7 +214,7 @@ with st.sidebar:
         st.session_state.pop("pages", None)
         st.rerun()
     st.divider()
-    st.caption("Sitemap берётся из robots.txt и sitemap.xml; при навигационном обходе проверяются несколько карточек товара на раздел.")
+    st.caption("По умолчанию проверяется путь пользователя: главная, её блоки, шапка, футер, статьи, каталог и несколько карточек товара на раздел.")
 
 
 if run:
