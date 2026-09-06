@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 import sys
-from collections import deque
+from heapq import heappop, heappush
 from urllib.parse import parse_qsl, urlencode, urldefrag, urljoin, urlparse, urlsplit, urlunsplit
 
 try:
@@ -285,8 +285,13 @@ def crawl_site(
         start_kind = "catalog" if _looks_like_catalog_url(start_url) else "home"
     if not smart_mode:
         start_kind = "generic"
-    queue = deque([(start_url, 0, start_kind)])
-    queued = {start_url}
+    queue = []
+    sequence = 0
+    priority_by_kind = {"home": 0, "catalog": 10, "product": 20, "content": 30, "nav": 15}
+    heappush(queue, (0, sequence, start_url, 0, start_kind))
+    known = {start_url}
+    scheduled = {start_url}
+    deferred_content: list[tuple[str, int, str]] = []
     results: list[dict] = []
     limit_reached = False
 
@@ -307,18 +312,45 @@ def crawl_site(
         page.set_default_navigation_timeout(NAVIGATION_TIMEOUT)
 
         def enqueue(link: str, depth: int, kind: str) -> None:
-            nonlocal limit_reached
-            if (max_depth is not None and depth > max_depth) or link in queued:
+            nonlocal limit_reached, sequence
+            if (max_depth is not None and depth > max_depth) or link in known:
                 return
-            if max_pages is not None and len(queued) >= max_pages:
+            known.add(link)
+            if kind == "content":
+                deferred_content.append((link, depth, kind))
+                return
+            if max_pages is not None and len(scheduled) >= max_pages:
                 limit_reached = True
                 return
-            queued.add(link)
-            queue.append((link, depth, kind))
+            scheduled.add(link)
+            sequence += 1
+            heappush(queue, (priority_by_kind.get(kind, 20), sequence, link, depth, kind))
+
+        def release_deferred_content() -> None:
+            nonlocal limit_reached, sequence
+            if not deferred_content:
+                return
+            available = None if max_pages is None else max_pages - len(scheduled)
+            if available == 0:
+                limit_reached = True
+                deferred_content.clear()
+                return
+            count = len(deferred_content) if available is None else min(len(deferred_content), available)
+            for _ in range(count):
+                link, depth, kind = deferred_content.pop(0)
+                scheduled.add(link)
+                sequence += 1
+                heappush(queue, (priority_by_kind.get(kind, 30), sequence, link, depth, kind))
+            if deferred_content:
+                limit_reached = True
 
         try:
-            while queue and (max_pages is None or len(results) < max_pages):
-                url, depth, kind = queue.popleft()
+            while (queue or deferred_content) and (max_pages is None or len(results) < max_pages):
+                if not queue:
+                    release_deferred_content()
+                    if not queue:
+                        break
+                _, _, url, depth, kind = heappop(queue)
                 if status:
                     total_label = "без лимита" if max_pages is None else str(max_pages)
                     status(f"Проверяется страница {len(results) + 1} из {total_label}: {url}")
@@ -342,6 +374,7 @@ def crawl_site(
                         "links": [],
                         "nav_links": [],
                     }
+                result["kind"] = kind
                 results.append(result)
                 if smart_mode:
                     next_depth = depth + 1
